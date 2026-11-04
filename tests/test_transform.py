@@ -28,11 +28,12 @@ class TestTierDiscount(unittest.TestCase):
         except:
             cls.spark = spark
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
+    # @classmethod
+    # def tearDownClass(cls):
+    #     cls.spark.stop()
 
     def test_apply_function(self):
+        #prepare data
         fact_sales_schema = StructType([
             StructField("transaction_id", IntegerType(), True),
             StructField("shop_id", IntegerType(), True),
@@ -62,6 +63,7 @@ class TestTierDiscount(unittest.TestCase):
         ]
         shop_df = self.spark.createDataFrame(shop_raw, shop_schema)
 
+        #Set expected data
         expected_schema = StructType([
             StructField("sales_date", DateType(), True),
             StructField("sum_sales", IntegerType(), True),
@@ -77,8 +79,9 @@ class TestTierDiscount(unittest.TestCase):
         ]
 
         expected_result = self.spark.createDataFrame(expected_data, expected_schema).sort(col("sales_date")).collect()
+        
+        #ผลลัพธ์ที่ได้จากการ run program
         actual_result = transform(sales_transaction_df=fact_sales_df, shop_dimension_df=shop_df).sort(col("sales_date")).collect()
-
         self.assertEqual(first=actual_result, second=expected_result)
 
 if __name__ == "__main__":
