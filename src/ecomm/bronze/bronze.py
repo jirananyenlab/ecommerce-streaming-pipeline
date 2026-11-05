@@ -7,40 +7,45 @@ from pyspark.sql.functions import *
 from delta.tables import DeltaTable
 from pyspark.sql.window import *
 
+# COMMAND ----------
+
+# MAGIC %run ../fw
 
 # COMMAND ----------
 
-
+file_format="csv"
+schema_evolution_mode="addNewColumnsWithTypeWidening"
+header=True
+infer_column_types=True
+path_file = "global_ecommerce_sales_*.csv"
+trigger={"availableNow": True}
+output_mode="append"
+volume = "/Volumes/workspace/e-commerce/e-commerce_sales_analysis"
+bronze_table = "workspace.`e-commerce`.sink"
+checkpoint = "/Volumes/workspace/e-commerce/checkpoint"
+schemalocation = "/Volumes/workspace/e-commerce/schemalocation"
+merge_schema=True
 
 # COMMAND ----------
 
-create_sink_table()
+bronze = BronzeLayer(
+    # Read configuration
+    file_format=file_format,
+    schema_evolution_mode=schema_evolution_mode,
+    header=header,
+    infer_column_types=infer_column_types,
+    schema_location=schemalocation,
+    load_location=f"{volume}/raw_data",
+    path_file=path_file,
 
-# COMMAND ----------
-
-#bronze layer
-df = (
-    spark.readStream
-    .format("cloudFiles")
-    .option("cloudFiles.format", "csv")
-    .option("cloudFiles.schemaEvolutionMode", "addNewColumnsWithTypeWidening") #addNewColumnsWithTypeWidening,addNewColumns,failOnNewColumns,rescue,none
-    .option("cloudFiles.inferColumnTypes",True)
-    .option("cloudFiles.schemaLocation", "/Volumes/workspace/e-commerce/schemalocation")
-    .load("/Volumes/workspace/e-commerce/e-commerce_sales_analysis/")
-    .withColumn("_file_name",col("_metadata.file_name"))
-    .withColumn("_file_path",col("_metadata.file_path"))
-    .withColumn("_file_size",col("_metadata.file_size"))
-    .withColumn("_file_mod",col("_metadata.file_modification_time"))
-    .withColumn("event_time",col("order_date"))
-    .withColumn("_processing_time",current_timestamp())
+    # Write configuration
+    output_mode=output_mode,
+    checkpoint_location=checkpoint,
+    trigger=trigger,
+    merge_schema=merge_schema,
+    table_bronze=bronze_table
     )
 
-(
-    df.writeStream
-    .outputMode("append")
-    .option("mergeSchema",True)
-    .option("checkpointLocation", "/Volumes/workspace/e-commerce/checkpoint")
-    .trigger(availableNow=True)
-    .toTable("workspace.`e-commerce`.sink")
+df = bronze.read_stream(spark)
 
-    )
+query = bronze.write_stream(df)
