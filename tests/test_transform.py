@@ -1,90 +1,106 @@
-try:
-    from unified_transform_logic.gold import transform
-except ImportError:
-    import os
-    import sys
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(current_dir)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    from logic_packages.src.unified_transform_logic.gold import transform
+            process_test_silver_batch(layer, batch_df)
 
-import unittest
-from pyspark.sql.types import StructType, StructField, StringType, FloatType, IntegerType, DateType
-from pyspark.sql.functions import col
-from datetime import date
-from pyspark.sql import SparkSession
+        def gold_batch(batch_df, batch_id):
+            merge_daily_sales(batch_df, batch_id, silver_table, gold_table)
 
+        silver_query = (
+            self.spark.readStream.table(self.bronze_table)
+            .writeStream.foreachBatch(silver_batch)
+            .option("checkpointLocation", f"{self.checkpoint}/silver")
+            .trigger(availableNow=True)
+            .start()
+        )
+        silver_query.awaitTermination()
 
-class TestTierDiscount(unittest.TestCase):
-    
-    @classmethod
-    def setUpClass(cls):
-        try:
-            cls.spark = SparkSession.builder \
-                .master("local[1]") \
-                .appName("unit-testing-unittest") \
-                .getOrCreate()
-        except:
-            cls.spark = spark
+        gold_query = (
+            self.spark.readStream
+            .option("readChangeFeed", "true")
+            .table(self.silver_table)
+            .writeStream.foreachBatch(gold_batch)
+            .option("checkpointLocation", f"{self.checkpoint}/gold")
+            .trigger(availableNow=True)
+            .start()
+        )
+        gold_query.awaitTermination()
 
-    # @classmethod
-    # def tearDownClass(cls):
-    #     cls.spark.stop()
-
-    def test_apply_function(self):
-        #prepare data
-        fact_sales_schema = StructType([
-            StructField("transaction_id", IntegerType(), True),
-            StructField("shop_id", IntegerType(), True),
-            StructField("sales_qty", IntegerType(), True),
-            StructField("sales_amt", FloatType(), True),
-            StructField("sales_date", DateType(), True)
-        ])
-        fact_sales_raw = [(1, 1, 88, 5000.02, date(2025,1,1)),
-                          (2, 1, 94, 318.44, date(2025,1,1)),
-                          (2, 3, 32, 134.48, date(2025,1,1)),
-                          (3, 2, 25, 8001.32, date(2025,12,1)),
-                          (4, 2, 7, 205.12, date(2025,12,1)),
-                          (5, 2, 98, 4959.73, date(2025,12,31)),
-                          (6, 2, 100, 6000.25, date(2025,12,31))]
-        fact_sales_df = self.spark.createDataFrame(fact_sales_raw, fact_sales_schema)
-
-        shop_schema = StructType([
-            StructField("shop_id", StringType(), True),
-            StructField("shop_name", StringType(), True),
-            StructField("branch_name", StringType(), True),
-            StructField("file_dt", StringType(), True)
-        ])
-        shop_raw = [
-            (1, "piti", "pharam2", date(2025,11,21)),
-            (2, "valen", "bangyai", date(2025,11,21)),
-            (3, "peter", "satupardit", date(2025,11,21))
-        ]
-        shop_df = self.spark.createDataFrame(shop_raw, shop_schema)
-
-        #Set expected data
+    def assert_gold(self, category, order_count, units, revenue):
         expected_schema = StructType([
-            StructField("sales_date", DateType(), True),
-            StructField("sum_sales", IntegerType(), True),
-            StructField("avg_sales", IntegerType(), True),
-            StructField("bucket_count", IntegerType(), True),
-            StructField("max_sales", FloatType(), True)
+            StructField("order_date", DateType(), True),
+            StructField("country", StringType(), True),
+            StructField("category", StringType(), True),
+            StructField("order_count", LongType(), True),
+            StructField("units_sold", LongType(), True),
+            StructField("revenue_usd", DecimalType(28, 2), True),
         ])
+        expected = self.spark.createDataFrame(
+            [(date(2026, 11, 5), "Japan", category, order_count, units, Decimal(revenue))],
+            expected_schema,
+        ).collect()
+        actual = self.spark.table(self.gold_table).collect()
+        self.assertEqual(actual, expected)
 
-        expected_data = [
-            (date(2025, 12, 31), 10959, 5479, 2, 6000.25),
-            (date(2025, 12, 1), 8206, 4103, 2, 8001.32),
-            (date(2025, 1, 1), 5452, 1817, 3, 5000.02)
-        ]
+    def test_scd1_cdf_group_move_and_retry(self):
+        old_time = datetime(2026, 11, 5, 9, 45)
+        new_time = datetime(2026, 11, 5, 9, 48)
 
-        expected_result = self.spark.createDataFrame(expected_data, expected_schema).sort(col("sales_date")).collect()
-        
-        #ผลลัพธ์ที่ได้จากการ run program
-        actual_result = transform(sales_transaction_df=fact_sales_df, shop_dimension_df=shop_df).sort(col("sales_date")).collect()
-        self.assertEqual(first=actual_result, second=expected_result)
+        # Round 1: insert one order.
+        first_batch = self.spark.createDataFrame([
+            ("1", "Japan", "Books", "10", "2", "11/5/2026", "20",
+             "round1.csv", old_time, None, None),
+        ], BRONZE_SCHEMA)
+        first_batch.write.mode("append").saveAsTable(self.bronze_table)
+        self.run_streams()
+        self.assert_gold("Books", 1, 2, "20.00")
 
-if __name__ == "__main__":
-    unittest.main()
+        # Round 2: update the order, move its group, and reject an invalid order.
+        second_batch = self.spark.createDataFrame([
+            ("1", "Japan", "Sports", "10", "3", "11/5/2026", "30",
+             "round2.csv", new_time, None, None),
+            ("2", "Japan", "Books", "10", "0", "11/5/2026", "0",
+             "round2.csv", new_time, None, None),
+        ], BRONZE_SCHEMA)
+        second_batch.write.mode("append").saveAsTable(self.bronze_table)
+        self.run_streams()
+        self.assert_gold("Sports", 1, 3, "30.00")
+        self.assertEqual(self.spark.table(self.silver_table).count(), 1)
+        self.assertEqual(self.spark.table(self.bad_table).count(), 1)
 
+        # Force a replay of the same Silver batch after its MERGE already committed.
+        process_test_silver_batch(self.layer, second_batch)
+        self.assertEqual(self.spark.table(self.silver_table).count(), 1)
+        self.assertEqual(self.spark.table(self.bad_table).count(), 1)
 
+        # Replay actual CDF, including the old and new group images.
+        changes = (
+            self.spark.read
+            .option("readChangeFeed", "true")
+            .option("startingVersion", 0)
+            .table(self.silver_table)
+        )
+        change_types = {row._change_type for row in changes.select("_change_type").distinct().collect()}
+        self.assertIn("update_preimage", change_types)
+        self.assertIn("update_postimage", change_types)
+        merge_daily_sales(changes, 999, self.silver_table, self.gold_table)
+        merge_daily_sales(changes, 999, self.silver_table, self.gold_table)
+        self.assert_gold("Sports", 1, 3, "30.00")
+
+        # An older processing timestamp cannot overwrite the newer order.
+        first_batch.write.mode("append").saveAsTable(self.bronze_table)
+        self.run_streams()
+        self.assert_gold("Sports", 1, 3, "30.00")
+        self.assertEqual(
+            self.spark.table(self.silver_table).first()._processing_time,
+            new_time,
+        )
+
+        # Starting both streams again with the same checkpoints adds nothing.
+        self.run_streams()
+        self.assert_gold("Sports", 1, 3, "30.00")
+
+suite = unittest.TestSuite()
+suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestSilverTransform))
+suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestStreamingPipeline))
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+
+if not result.wasSuccessful():
+    raise AssertionError("Pipeline tests failed. Read the unittest output above.")
